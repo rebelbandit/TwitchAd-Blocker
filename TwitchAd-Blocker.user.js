@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TwitchAd Blocker
 // @namespace    rebelbandit.twitch
-// @version      1.1.0
-// @description  VAFT2 Twitch adblock + automatic frozen-video recovery + discreet toast + persistent diagnostics
+// @version      1.1.1
+// @description  VAFT2 Twitch adblock + automatic frozen-video recovery + duplicate-audio cleanup + discreet toast + persistent diagnostics
 // @author       scamorza + rebel_bandit
 // @match        *://*.twitch.tv/*
 // @run-at       document-start
@@ -40,6 +40,10 @@
 
         // Keep OFF: Twitch reload can trigger another preroll
         reloadOnFailure: false,
+
+        // Duplicate audio cleanup after ad ends
+        audioCleanup: true,
+        audioCleanupDelayMs: 300,
 
         // Toast
         toast: true,
@@ -199,6 +203,7 @@
         lastBackupType: null,
 
         toastTimer: null,
+        audioCleanupTimer: null,
 
         counters: {
             adBreaks: 0,
@@ -206,7 +211,9 @@
             qualityBounces: 0,
             pausePlays: 0,
             recovered: 0,
-            failed: 0
+            failed: 0,
+            duplicateAudioCleanups: 0,
+            duplicatePlayersStopped: 0
         }
     };
 
@@ -488,6 +495,175 @@
                     a.clientHeight
                 )
             )[0] || videos[0];
+    }
+
+
+    // ============================================================
+    // DUPLICATE AUDIO CLEANUP - v1.1.1
+    // ============================================================
+
+    function getVideoAudioStatus() {
+        const activeVideo =
+            getVideo();
+
+        const videos =
+            [...document.querySelectorAll(
+                'video'
+            )];
+
+        return videos.map(
+            (video, index) => ({
+                index,
+
+                active:
+                    video === activeVideo,
+
+                connected:
+                    video.isConnected,
+
+                paused:
+                    video.paused,
+
+                ended:
+                    video.ended,
+
+                muted:
+                    video.muted,
+
+                volume:
+                    video.volume,
+
+                readyState:
+                    video.readyState,
+
+                currentTime:
+                    Number.isFinite(
+                        video.currentTime
+                    )
+                        ? Math.round(
+                            video.currentTime *
+                            10
+                        ) / 10
+                        : null,
+
+                resolution:
+                    `${video.videoWidth}x${video.videoHeight}`,
+
+                width:
+                    video.clientWidth,
+
+                height:
+                    video.clientHeight
+            })
+        );
+    }
+
+
+    function cleanupDuplicateAudio() {
+        try {
+            const activeVideo =
+                getVideo();
+
+            const videos =
+                [...document.querySelectorAll(
+                    'video'
+                )];
+
+            if (!videos.length) {
+                return 0;
+            }
+
+            if (!activeVideo) {
+                eventLog(
+                    'AUDIO CLEANUP SKIPPED',
+                    'active video not found'
+                );
+
+                return 0;
+            }
+
+            let cleaned = 0;
+
+            for (const video of videos) {
+                if (
+                    video === activeVideo
+                ) {
+                    continue;
+                }
+
+                /*
+                 * Only touch secondary media elements
+                 * that could actually still produce
+                 * duplicate stream audio.
+                 */
+                if (
+                    !video.paused &&
+                    !video.ended &&
+                    video.readyState > 0
+                ) {
+                    try {
+                        video.muted = true;
+                        video.volume = 0;
+                        video.pause();
+
+                        cleaned++;
+
+                    } catch {}
+                }
+            }
+
+            if (cleaned > 0) {
+                State.counters
+                    .duplicateAudioCleanups++;
+
+                State.counters
+                    .duplicatePlayersStopped +=
+                    cleaned;
+
+                eventLog(
+                    'DUPLICATE AUDIO CLEANUP',
+                    {
+                        extraPlayersStopped:
+                            cleaned,
+
+                        totalVideoElements:
+                            videos.length
+                    }
+                );
+
+                log(
+                    'Duplicate audio cleanup:',
+                    cleaned,
+                    'extra video player(s) stopped'
+                );
+            }
+
+            return cleaned;
+
+        } catch (err) {
+            eventLog(
+                'AUDIO CLEANUP ERROR',
+                String(err)
+            );
+
+            return 0;
+        }
+    }
+
+
+    function scheduleAudioCleanup() {
+        if (!CFG.audioCleanup) {
+            return;
+        }
+
+        clearTimeout(
+            State.audioCleanupTimer
+        );
+
+        State.audioCleanupTimer =
+            setTimeout(() => {
+                cleanupDuplicateAudio();
+            }, CFG.audioCleanupDelayMs);
     }
 
 
@@ -1196,6 +1372,16 @@
             State.counters.adBreaks++;
 
 
+            /*
+             * Cancel any pending cleanup from a previous ad
+             * if another ad state starts immediately.
+             */
+
+            clearTimeout(
+                State.audioCleanupTimer
+            );
+
+
             State.video =
                 getVideo();
 
@@ -1243,6 +1429,23 @@
                 performance.now();
 
 
+            /*
+             * v1.1.1:
+             *
+             * VAFT/Twitch can occasionally leave a stale
+             * video element alive after returning from the
+             * backup stream.
+             *
+             * That can cause the normal stream + stale
+             * stream audio to play simultaneously.
+             *
+             * Give Twitch a moment to settle, then stop
+             * audio from secondary video elements.
+             */
+
+            scheduleAudioCleanup();
+
+
             toast(
                 'Ad skipped ✓',
                 1600
@@ -1262,7 +1465,11 @@
                         State.counters.recovered,
 
                     failed:
-                        State.counters.failed
+                        State.counters.failed,
+
+                    audioCleanups:
+                        State.counters
+                            .duplicateAudioCleanups
                 }
             );
 
@@ -1537,7 +1744,7 @@
                 vaftStatus();
 
             const result = {
-                version: '1.1.0',
+                version: '1.1.1',
 
                 vaftVersion:
                     vaft?.version || null,
@@ -1565,6 +1772,12 @@
                         performance.now() -
                         State.lastProgressAt
                     ),
+
+                videoElements:
+                    document
+                        .querySelectorAll(
+                            'video'
+                        ).length,
 
                 counters: {
                     ...State.counters
@@ -1597,6 +1810,9 @@
                 frozenForMs:
                     result.frozenForMs,
 
+                videoElements:
+                    result.videoElements,
+
                 adBreaks:
                     result
                         .counters
@@ -1615,11 +1831,64 @@
                 failed:
                     result
                         .counters
-                        .failed
+                        .failed,
+
+                audioCleanups:
+                    result
+                        .counters
+                        .duplicateAudioCleanups,
+
+                extraPlayersStopped:
+                    result
+                        .counters
+                        .duplicatePlayersStopped
             });
 
 
             return result;
+        },
+
+
+        audioStatus() {
+            const result =
+                getVideoAudioStatus();
+
+            console.table(result);
+
+            return result;
+        },
+
+
+        cleanupAudio() {
+            const before =
+                getVideoAudioStatus();
+
+            console.log(
+                '[RB-VAFT] audio status BEFORE cleanup'
+            );
+
+            console.table(before);
+
+
+            const cleaned =
+                cleanupDuplicateAudio();
+
+
+            const after =
+                getVideoAudioStatus();
+
+            console.log(
+                '[RB-VAFT] audio status AFTER cleanup'
+            );
+
+            console.table(after);
+
+
+            return {
+                cleaned,
+                before,
+                after
+            };
         },
 
 
@@ -1707,6 +1976,16 @@
                         'RECOVERY FAILED'
                     ),
 
+                duplicateAudioCleanups:
+                    count(
+                        'DUPLICATE AUDIO CLEANUP'
+                    ),
+
+                audioCleanupErrors:
+                    count(
+                        'AUDIO CLEANUP ERROR'
+                    ),
+
                 storedEvents:
                     entries.length
             };
@@ -1761,7 +2040,7 @@
 
 
     console.log(
-        '[RB-VAFT] loaded — v1.1.0'
+        '[RB-VAFT] loaded — v1.1.1'
     );
 
 })();
